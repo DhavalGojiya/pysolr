@@ -24,9 +24,10 @@ except ImportError:
 import contextlib
 import html.entities as htmlentities
 from http.client import HTTPException
+from typing import Any
 from urllib.parse import quote, urlencode
 
-__all__ = ["Solr"]
+__all__ = ["Solr", "SolrCoreAdmin", "SolrNodeAdmin"]
 
 
 DATETIME_REGEX = re.compile(
@@ -1396,6 +1397,421 @@ class SolrCoreAdmin:
         """
         params = {"action": "UNLOAD", "core": core}
         return self._send_request(self.url, params=params)
+
+
+class SolrNodeAdmin:
+    """
+    Handles node admin operations, which report on a running Solr node.
+
+    Unlike :class:`SolrCoreAdmin`, this is initialized with the Solr base URL
+    rather than the URL of a single handler::
+
+        node_admin = SolrNodeAdmin("http://localhost:8983/solr")
+        version = node_admin.version()
+
+    Endpoints offered by Solr are:
+       1. /admin/info/system
+       2. /admin/info/properties
+       3. /admin/info/threads
+       4. /admin/info/logging
+       5. /admin/info/health
+       6. /admin/info/key
+       7. /admin/metrics
+       8. /admin/zookeeper/status
+
+    See -> https://solr.apache.org/guide/solr/9_0/configuration-guide/implicit-requesthandlers.html
+    """
+
+    def __init__(
+        self,
+        url: str,
+        timeout: int = 60,
+        auth: Any = None,
+        verify: bool = True,
+        session: requests.Session | None = None,
+    ) -> None:
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self.log = self._get_log()
+        self.auth = auth
+        self.verify = verify
+        self.session = session
+
+    def get_session(self) -> requests.Session:
+        """
+        Returns a requests Session object to use for sending requests to Solr.
+
+        The session is created lazily on first call to this method, and is
+        reused for all subsequent requests.
+
+        :return: requests.Session instance
+        """
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.verify = self.verify
+        return self.session
+
+    def _get_log(self) -> logging.Logger:
+        return LOG
+
+    def _send_request(
+        self, url: str, params: dict | None = None, headers: dict | None = None
+    ) -> Any:
+        """
+        Internal method to send a GET request to Solr.
+
+        :param url: Full URL to query
+        :param params: Dictionary of query parameters
+        :param headers: Dictionary of HTTP headers
+        :return: JSON response from Solr, or the body as text when Solr answers
+            in another format, as /admin/metrics does on Solr 10
+        :raises SolrError: if the request fails or the JSON response cannot be decoded
+        """
+        if params is None:
+            params = {}
+        if headers is None:
+            headers = {}
+
+        session = self.get_session()
+
+        self.log.debug(
+            "Starting Solr node admin request to '%s' with params %s",
+            url,
+            params,
+        )
+
+        try:
+            resp = session.get(
+                url,
+                params=params,
+                headers=headers,
+                auth=self.auth,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+
+            if resp.headers.get("Content-Type", "").startswith("application/json"):
+                return resp.json()
+
+            return resp.text
+
+        except requests.exceptions.HTTPError as e:
+            error_url = e.response.url
+            error_msg = e.response.text
+            error_code = e.response.status_code
+
+            self.log.exception(
+                "Solr returned HTTP error %s for URL %s", error_code, error_url
+            )
+            raise SolrError(
+                f"Solr returned HTTP error {error_code}. Response body: {error_msg}"
+            ) from e
+
+        except requests.exceptions.JSONDecodeError as e:
+            self.log.exception("Failed to decode JSON response from Solr at %s", url)
+            raise SolrError(
+                f"Failed to decode JSON response: {e}. Response text: {resp.text}"
+            ) from e
+
+        except requests.exceptions.RequestException as e:
+            self.log.exception("Request to Solr failed for URL %s", url)
+            raise SolrError(f"Request failed: {e}") from e
+
+    def system(self) -> dict[str, Any]:
+        """Return JVM and OS level system info."""
+        return self._send_request(f"{self.url}/admin/info/system")
+
+    def threads(self) -> dict[str, Any]:
+        """Return thread dump."""
+        return self._send_request(f"{self.url}/admin/info/threads")
+
+    def properties(self) -> dict[str, Any]:
+        """Return JVM system properties."""
+        return self._send_request(f"{self.url}/admin/info/properties")
+
+    def logging(self, since: int | None = None) -> dict[str, Any]:
+        """
+        Return logging configuration.
+
+        See -> https://solr.apache.org/guide/solr/9_0/deployment-guide/configuring-logging.html
+
+        :param since: timestamp in milliseconds; when given, Solr returns the
+            log events it has buffered since then instead of the logger listing
+        """
+        params = {} if since is None else {"since": since}
+        return self._send_request(f"{self.url}/admin/info/logging", params=params)
+
+    def set_log_level(self, logger: str, level: str) -> dict[str, Any]:
+        """
+        Set the level of a logger on the running node.
+
+        See -> https://solr.apache.org/guide/solr/9_0/deployment-guide/configuring-logging.html
+
+        :param logger: logger name, such as "org.apache.solr"; the root logger
+            is named "root"
+        :param level: one of the levels reported by :meth:`logging`, or "unset"
+            to drop a level set earlier
+        """
+        params = {"set": f"{logger}:{level}"}
+        return self._send_request(f"{self.url}/admin/info/logging", params=params)
+
+    def health(
+        self, require_healthy_cores: bool = False, max_generation_lag: int | None = None
+    ) -> dict[str, Any]:
+        """
+        Return the health report of the node.
+
+        In SolrCloud mode Solr also checks that the node is live and registered
+        in ZooKeeper. Each of the two checks below applies to one mode only, and
+        Solr reports in its message which check it has skipped.
+
+        :param require_healthy_cores: SolrCloud only; report a failure while any
+            core of an active shard is still recovering
+        :param max_generation_lag: user-managed clusters only; report a failure
+            when a follower is more index generations than this behind its
+            leader
+        """
+        params = {}
+
+        if require_healthy_cores:
+            params["requireHealthyCores"] = "true"
+
+        if max_generation_lag is not None:
+            params["maxGenerationLag"] = max_generation_lag
+
+        return self._send_request(f"{self.url}/admin/info/health", params=params)
+
+    def key(self) -> str:
+        """
+        Return the public key the node uses for PKI authentication.
+
+        Nodes generate the key when they start, so it changes on a restart.
+        """
+        response = self._send_request(f"{self.url}/admin/info/key")
+
+        try:
+            return response["key"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the public key") from e
+
+    def zookeeper_status(self) -> dict[str, Any]:
+        """
+        Return the status of the ZooKeeper ensemble.
+
+        SolrCloud only: a standalone node answers with an HTTP error.
+        """
+        return self._send_request(f"{self.url}/admin/zookeeper/status")
+
+    def metrics(self, **params: Any) -> dict[str, Any] | str:
+        """
+        Return the metrics of the node.
+
+        Solr 9 answers with JSON, filtered by ``group``, ``prefix``, ``key``
+        and ``type``, so the decoded response is returned. Solr 10 serves
+        Prometheus text instead, filtered by ``name``, ``category``, ``core``,
+        ``collection``, ``shard`` and ``replica_type``, and that exposition
+        text is returned unparsed.
+
+        See -> https://solr.apache.org/guide/solr/9_0/deployment-guide/metrics-reporting.html
+
+        :return: dict on Solr 9, str on Solr 10
+        """
+        return self._send_request(f"{self.url}/admin/metrics", params=params)
+
+    def version(self) -> str:
+        """Return the Solr version (e.g., '9.10.1')."""
+        info = self.system()
+
+        try:
+            return info["lucene"]["solr-spec-version"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the running Solr version") from e
+
+    def version_tuple(self) -> tuple[int, int, int]:
+        """
+        Return the Solr version as a tuple (major, minor, patch).
+
+        A qualifier is dropped, so '10.0.0-SNAPSHOT' gives (10, 0, 0).
+        """
+        version = self.version()
+
+        try:
+            parts = [int(part) for part in version.split("-")[0].split(".")]
+        except (AttributeError, ValueError) as e:
+            raise SolrError(f"Invalid Solr version format: {version}") from e
+
+        parts.extend([0] * (3 - len(parts)))
+        return tuple(parts[:3])
+
+    def memory_usage_ratio(self) -> float:
+        """Return the used fraction (0-1) of the JVM heap."""
+        info = self.system()
+
+        try:
+            return info["jvm"]["memory"]["raw"]["used%"] / 100
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the JVM memory usage") from e
+
+    def memory_used_mb(self) -> float:
+        """Return used JVM memory in MB."""
+        info = self.system()
+
+        try:
+            return info["jvm"]["memory"]["raw"]["used"] / (1024 * 1024)
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the JVM memory usage") from e
+
+    def uptime_seconds(self) -> float:
+        """Return Solr uptime in seconds."""
+        info = self.system()
+
+        try:
+            return info["jvm"]["jmx"]["upTimeMS"] / 1000
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the uptime") from e
+
+    def is_healthy(
+        self, require_healthy_cores: bool = False, max_generation_lag: int | None = None
+    ) -> bool:
+        """
+        Return True while the node reports itself healthy.
+
+        A node that cannot be reached, or that reports a failure with HTTP 503,
+        is unhealthy rather than an error. A request Solr rejects still raises,
+        so a client asking the wrong URL is not read as a node being down.
+
+        :param require_healthy_cores: SolrCloud only; report a failure while any
+            core of an active shard is still recovering
+        :param max_generation_lag: user-managed clusters only; report a failure
+            when a follower is more index generations than this behind its
+            leader
+        :raises SolrError: if Solr answers with a 4xx, such as the 404 of a URL
+            that is not a node
+        """
+        try:
+            report = self.health(
+                require_healthy_cores=require_healthy_cores,
+                max_generation_lag=max_generation_lag,
+            )
+        except SolrError as e:
+            # The HTTP error Solr answered with is chained to the SolrError, and
+            # a 4xx of it means Solr rejected the request rather than the node
+            # being unwell.
+            response = getattr(e.__cause__, "response", None)
+
+            if response is not None and 400 <= response.status_code < 500:
+                raise
+
+            return False
+
+        return report.get("status") == "OK"
+
+    def cpu_usage_ratio(self) -> float:
+        """
+        Return the CPU load (0-1) of the machine running the node.
+
+        The JVM reports -1 where the value is unavailable.
+        """
+        info = self.system()
+
+        try:
+            return info["system"]["cpuLoad"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the CPU load") from e
+
+    def load_average(self) -> float:
+        """
+        Return the system load average of the last minute.
+
+        This is a run queue length rather than a ratio, and the JVM reports -1
+        on platforms that do not provide it, such as Windows.
+        """
+        info = self.system()
+
+        try:
+            return info["system"]["systemLoadAverage"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the load average") from e
+
+    def java_version(self) -> str:
+        """Return JVM version (e.g., '21.0.10')."""
+        props = self.properties()
+
+        try:
+            return props["system.properties"]["java.version"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the Java version") from e
+
+    def solr_home(self) -> str:
+        """Return Solr home directory."""
+        props = self.properties()
+
+        try:
+            return props["system.properties"]["solr.solr.home"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the Solr home") from e
+
+    def solr_install_dir(self) -> str:
+        """Return Solr installation directory."""
+        props = self.properties()
+
+        try:
+            return props["system.properties"]["solr.install.dir"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the Solr install dir") from e
+
+    def mode(self) -> str:
+        """Return Solr running mode ('std' or 'solrcloud')."""
+        info = self.system()
+
+        try:
+            return info["mode"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the Solr mode") from e
+
+    def is_standalone(self) -> bool:
+        """Return True if running in standalone mode."""
+        return self.mode() == "std"
+
+    def is_solrcloud(self) -> bool:
+        """Return True if running in SolrCloud mode."""
+        return self.mode() == "solrcloud"
+
+    def port(self) -> int:
+        """Return the port Solr is listening on."""
+        props = self.properties()
+        system_props = props.get("system.properties", {})
+
+        # Solr 9 publishes the port as "jetty.port", Solr 10 as "solr.port.listen".
+        port = system_props.get("jetty.port") or system_props.get("solr.port.listen")
+
+        try:
+            return int(port)
+        except (TypeError, ValueError) as e:
+            raise SolrError(f"Unable to determine the Solr port: {port!r}") from e
+
+    def os_info(self) -> dict[str, str]:
+        """Return OS information."""
+        props = self.properties()
+
+        try:
+            system_props = props["system.properties"]
+            return {
+                "name": system_props["os.name"],
+                "version": system_props["os.version"],
+                "arch": system_props["os.arch"],
+            }
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the OS info") from e
+
+    def timezone(self) -> str:
+        """Return JVM timezone."""
+        props = self.properties()
+
+        try:
+            return props["system.properties"]["user.timezone"]
+        except (KeyError, TypeError) as e:
+            raise SolrError("Unable to determine the timezone") from e
 
 
 class SolrCloud(Solr):

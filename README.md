@@ -22,6 +22,7 @@ ______________________________________________________________________
 - [Usage](#usage)
   - [For SolrCloud mode](#for-solrcloud-mode-initialize-your-solr-like-this)
   - [Multicore Index](#multicore-index)
+  - [Node Administration](#node-administration)
   - [Custom Request Handlers](#custom-request-handlers)
   - [Custom Authentication](#custom-authentication)
   - [If your Solr servers run off https](#if-your-solr-servers-run-off-https)
@@ -164,6 +165,49 @@ Simply point the URL to the index core:
 # Setup a Solr instance. The timeout is optional.
 solr = pysolr.Solr("http://localhost:8983/solr/<core_name>", timeout=10)
 ```
+
+### Node Administration
+
+`SolrNodeAdmin` reports on a running node. Point it at the Solr base URL
+rather than at a core:
+
+```python
+node_admin = pysolr.SolrNodeAdmin("http://localhost:8983/solr", timeout=10)
+
+# Admin endpoints.
+node_admin.system()
+node_admin.properties()
+node_admin.threads()
+node_admin.logging()
+node_admin.set_log_level("org.apache.solr", "DEBUG")
+node_admin.health()
+node_admin.metrics(group="jvm")
+node_admin.zookeeper_status()  # SolrCloud only
+
+# Values read out of those responses.
+node_admin.version()  # "9.10.1"
+node_admin.version_tuple()  # (9, 10, 1)
+node_admin.mode()  # "std" or "solrcloud"
+node_admin.port()
+node_admin.key()  # PKI public key of the node
+node_admin.uptime_seconds()
+node_admin.memory_usage_ratio()
+node_admin.is_healthy()
+```
+
+Each accessor makes its own request, so reading several of them is cheaper
+from one response:
+
+```python
+info = node_admin.system()
+version = info["lucene"]["solr-spec-version"]
+mode = info["mode"]
+```
+
+`metrics()` returns the decoded JSON on Solr 9, filtered by `group`,
+`prefix`, `key` and `type`. Solr 10 serves Prometheus text instead, filtered
+by `name`, `category`, `core`, `collection`, `shard` and `replica_type`, and
+returns that exposition text as a string.
 
 ### Custom Request Handlers
 
