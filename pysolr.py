@@ -39,6 +39,40 @@ VALID_XML_CHARS_REGEX = re.compile(
     "[^\u0020-\ud7ff\u0009\u000a\u000d\ue000-\ufffd\U00010000-\U0010ffff]+"
 )
 
+# Using two-tuples to preserve order.
+REPLACEMENTS = (
+    # Nuke nasty control characters.
+    (b"\x00", b""),  # Start of heading
+    (b"\x01", b""),  # Start of heading
+    (b"\x02", b""),  # Start of text
+    (b"\x03", b""),  # End of text
+    (b"\x04", b""),  # End of transmission
+    (b"\x05", b""),  # Enquiry
+    (b"\x06", b""),  # Acknowledge
+    (b"\x07", b""),  # Ring terminal bell
+    (b"\x08", b""),  # Backspace
+    (b"\x0b", b""),  # Vertical tab
+    (b"\x0c", b""),  # Form feed
+    (b"\x0e", b""),  # Shift out
+    (b"\x0f", b""),  # Shift in
+    (b"\x10", b""),  # Data link escape
+    (b"\x11", b""),  # Device control 1
+    (b"\x12", b""),  # Device control 2
+    (b"\x13", b""),  # Device control 3
+    (b"\x14", b""),  # Device control 4
+    (b"\x15", b""),  # Negative acknowledge
+    (b"\x16", b""),  # Synchronous idle
+    (b"\x17", b""),  # End of transmission block
+    (b"\x18", b""),  # Cancel
+    (b"\x19", b""),  # End of medium
+    (b"\x1a", b""),  # Substitute character
+    (b"\x1b", b""),  # Escape
+    (b"\x1c", b""),  # File separator
+    (b"\x1d", b""),  # Group separator
+    (b"\x1e", b""),  # Record separator
+    (b"\x1f", b""),  # Unit separator
+)
+
 
 class NullHandler(logging.Handler):
     def emit(self, record):
@@ -129,6 +163,15 @@ def clean_xml_string(s):
     http://stackoverflow.com/questions/8733233/filtering-out-certain-bytes-in-python
     """
     return VALID_XML_CHARS_REGEX.sub("", s)
+
+
+def sanitize(data):
+    fixed_string = force_bytes(data)
+
+    for bad, good in REPLACEMENTS:
+        fixed_string = fixed_string.replace(bad, good)
+
+    return force_unicode(fixed_string)
 
 
 class SolrError(Exception):
@@ -1288,7 +1331,7 @@ class SolrCoreAdmin:
         session = self.get_session()
 
         self.log.debug(
-            "Starting Solr admin request to '%s' with params %s",
+            "Starting Solr core admin request to '%s' with params %s",
             url,
             params,
         )
@@ -1299,6 +1342,7 @@ class SolrCoreAdmin:
                 params=params,
                 headers=headers,
                 auth=self.auth,
+                timeout=self.timeout,
             )
             resp.raise_for_status()
             return resp.json()
@@ -1320,6 +1364,7 @@ class SolrCoreAdmin:
             raise SolrError(
                 f"Failed to decode JSON response: {e}. Response text: {resp.text}"
             ) from e
+
         except requests.exceptions.RequestException as e:
             self.log.exception("Request to Solr failed for URL %s", url)
             raise SolrError(f"Request failed: {e}") from e
@@ -1394,48 +1439,246 @@ class SolrCoreAdmin:
         raise NotImplementedError("Solr 1.4 and below do not support this operation.")
 
 
-# Using two-tuples to preserve order.
-REPLACEMENTS = (
-    # Nuke nasty control characters.
-    (b"\x00", b""),  # Start of heading
-    (b"\x01", b""),  # Start of heading
-    (b"\x02", b""),  # Start of text
-    (b"\x03", b""),  # End of text
-    (b"\x04", b""),  # End of transmission
-    (b"\x05", b""),  # Enquiry
-    (b"\x06", b""),  # Acknowledge
-    (b"\x07", b""),  # Ring terminal bell
-    (b"\x08", b""),  # Backspace
-    (b"\x0b", b""),  # Vertical tab
-    (b"\x0c", b""),  # Form feed
-    (b"\x0e", b""),  # Shift out
-    (b"\x0f", b""),  # Shift in
-    (b"\x10", b""),  # Data link escape
-    (b"\x11", b""),  # Device control 1
-    (b"\x12", b""),  # Device control 2
-    (b"\x13", b""),  # Device control 3
-    (b"\x14", b""),  # Device control 4
-    (b"\x15", b""),  # Negative acknowledge
-    (b"\x16", b""),  # Synchronous idle
-    (b"\x17", b""),  # End of transmission block
-    (b"\x18", b""),  # Cancel
-    (b"\x19", b""),  # End of medium
-    (b"\x1a", b""),  # Substitute character
-    (b"\x1b", b""),  # Escape
-    (b"\x1c", b""),  # File separator
-    (b"\x1d", b""),  # Group separator
-    (b"\x1e", b""),  # Record separator
-    (b"\x1f", b""),  # Unit separator
-)
+class SolrNodeAdmin:
+    """Access Solr node-level admin APIs (/admin/info/*)."""
 
+    def __init__(self, url, timeout=60, auth=None, verify=True, session=None):
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self.log = self._get_log()
+        self.auth = auth
+        self.verify = verify
+        self.session = session
 
-def sanitize(data):
-    fixed_string = force_bytes(data)
+    def get_session(self):
+        """
+        Returns a requests Session object to use for sending requests to Solr.
 
-    for bad, good in REPLACEMENTS:
-        fixed_string = fixed_string.replace(bad, good)
+        The session is created lazily on first call to this method, and is
+        reused for all subsequent requests.
 
-    return force_unicode(fixed_string)
+        :return: requests.Session instance
+        """
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.verify = self.verify
+        return self.session
+
+    def _get_log(self):
+        return LOG
+
+    def _send_request(self, url, params=None, headers=None):
+        """
+        Internal method to send a GET request to Solr.
+
+        :param url: Full URL to query
+        :param params: Dictionary of query parameters
+        :param headers: Dictionary of HTTP headers
+        :return: JSON response from Solr
+        :raises SolrError: if the request fails or the JSON response cannot be decoded
+        """
+        if params is None:
+            params = {}
+        if headers is None:
+            headers = {}
+
+        session = self.get_session()
+
+        self.log.debug(
+            "Starting Solr node admin request to '%s' with params %s",
+            url,
+            params,
+        )
+
+        try:
+            resp = session.get(
+                url,
+                params=params,
+                headers=headers,
+                auth=self.auth,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        except requests.exceptions.HTTPError as e:
+            error_url = e.response.url
+            error_msg = e.response.text
+            error_code = e.response.status_code
+
+            self.log.exception(
+                "Solr returned HTTP error %s for URL %s", error_code, error_url
+            )
+            raise SolrError(
+                f"Solr returned HTTP error {error_code}. Response body: {error_msg}"
+            ) from e
+
+        except requests.exceptions.JSONDecodeError as e:
+            self.log.exception("Failed to decode JSON response from Solr at %s", url)
+            raise SolrError(
+                f"Failed to decode JSON response: {e}. Response text: {resp.text}"
+            ) from e
+
+        except requests.exceptions.RequestException as e:
+            self.log.exception("Request to Solr failed for URL %s", url)
+            raise SolrError(f"Request failed: {e}") from e
+
+    def system(self):
+        """Return JVM and OS level system info."""
+        return self._send_request(f"{self.url}/admin/info/system")
+
+    def threads(self):
+        """Return thread dump."""
+        return self._send_request(f"{self.url}/admin/info/threads")
+
+    def logging(self):
+        """Return logging configuration."""
+        return self._send_request(f"{self.url}/admin/info/logging")
+
+    def properties(self):
+        """Return JVM system properties."""
+        return self._send_request(f"{self.url}/admin/info/properties")
+
+    def version(self):
+        """Return the Solr version (e.g., '9.2.1')."""
+        info = self.system()
+        try:
+            return info["lucene"]["solr-spec-version"]
+        except KeyError as e:
+            raise SolrError(
+                "Unable to determine running Solr version from system info"
+            ) from e
+
+    def version_tuple(self):
+        """Return the Solr version as a tuple (major, minor, patch)."""
+        version = self.version()
+        try:
+            parts = list(map(int, version.split(".")))
+            while len(parts) < 3:
+                parts.append(0)
+            return tuple(parts[:3])
+        except Exception as e:
+            raise SolrError(f"Invalid Solr version format: {version}") from e
+
+    def memory_usage_ratio(self):
+        """Return JVM memory usage ratio (0-1)."""
+        info = self.system()
+        try:
+            return info["jvm"]["memory"]["raw"]["used%"] / 100
+        except KeyError as e:
+            raise SolrError("Unable to determine JVM memory usage") from e
+
+    def uptime_seconds(self):
+        """Return Solr uptime in seconds."""
+        info = self.system()
+        try:
+            return info["jvm"]["jmx"]["upTimeMS"] / 1000
+        except KeyError as e:
+            raise SolrError("Unable to determine uptime") from e
+
+    def is_healthy(self):
+        """Return True if Solr reports healthy status."""
+        info = self.system()
+        return info.get("responseHeader", {}).get("status") == 0
+
+    def cpu_load(self):
+        """Return system CPU load."""
+        info = self.system()
+        try:
+            return info["system"]["systemLoadAverage"]
+        except KeyError as e:
+            raise SolrError("Unable to determine CPU load") from e
+
+    def memory_used_mb(self):
+        """Return used JVM memory in MB."""
+        info = self.system()
+        try:
+            return info["jvm"]["memory"]["raw"]["used"] / (1024 * 1024)
+        except KeyError as e:
+            raise SolrError("Unable to determine memory usage") from e
+
+    def java_version(self):
+        """Return JVM version (e.g., '21.0.10')."""
+        info = self.properties()
+        try:
+            return info["system.properties"]["java.version"]
+        except KeyError as e:
+            raise SolrError("Unable to determine Java version") from e
+
+    def solr_home(self):
+        """Return Solr home directory."""
+        info = self.properties()
+        try:
+            return info["system.properties"]["solr.solr.home"]
+        except KeyError as e:
+            raise SolrError("Unable to determine Solr home") from e
+
+    def solr_install_dir(self):
+        """Return Solr installation directory."""
+        info = self.properties()
+        try:
+            return info["system.properties"]["solr.install.dir"]
+        except KeyError as e:
+            raise SolrError("Unable to determine Solr install dir") from e
+
+    def mode(self):
+        """Return Solr running mode ('std' or 'solrcloud')."""
+        info = self.system()
+        try:
+            return info["mode"]
+        except KeyError as e:
+            raise SolrError("Unable to determine Solr mode") from e
+
+    def is_standalone(self):
+        """Return True if running in standalone mode."""
+        return self.mode() == "std"
+
+    def is_solrcloud(self):
+        """Return True if running in SolrCloud mode."""
+        return self.mode() == "solrcloud"
+
+    def port(self):
+        """Return Jetty port Solr is running on."""
+        info = self.properties()
+        props = info.get("system.properties", {})
+
+        # Solr 9 returns "jetty.port"; Solr 10 returns "solr.port.listen".
+        port = props.get("jetty.port") or props.get("solr.port.listen")
+        if not port:
+            raise SolrError("Unable to determine Solr port")
+        return int(port)
+
+    def os_info(self):
+        """Return OS information."""
+        info = self.properties()
+        try:
+            props = info["system.properties"]
+            return {
+                "name": props["os.name"],
+                "version": props["os.version"],
+                "arch": props["os.arch"],
+            }
+        except KeyError as e:
+            raise SolrError("Unable to determine OS info") from e
+
+    def timezone(self):
+        """Return JVM timezone."""
+        info = self.properties()
+        try:
+            return info["system.properties"]["user.timezone"]
+        except KeyError as e:
+            raise SolrError("Unable to determine timezone") from e
+
+    def summary(self):
+        """Return a compact summary of node health."""
+        return {
+            "version": self.version(),
+            "mode": self.mode(),
+            "uptime_sec": self.uptime_seconds(),
+            "memory_usage": self.memory_usage_ratio(),
+            "cpu_load": self.cpu_load(),
+            "healthy": self.is_healthy(),
+        }
 
 
 class SolrCloud(Solr):
