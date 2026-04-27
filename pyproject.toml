@@ -41,6 +41,9 @@ test = [
   "coverage",
   "pytest>=9.0.2",
 ]
+docs = [
+  "zensical>=0.0.36",
+]
 
 [tool.hatch]
 build.targets.sdist.exclude = [ ".github" ]
