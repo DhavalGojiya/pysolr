@@ -6,6 +6,11 @@ on:
         branches: [master]
     pull_request:
         branches: [master]
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
 jobs:
     test:
         name: Test (Python ${{ matrix.python }}, Solr ${{ matrix.solr }})
